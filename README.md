@@ -1,6 +1,6 @@
 # encoder-sim
 
-**Educational file transfer system with chunked canonical Huffman compression over simulated unreliable networks.**
+**File transfer system with chunked canonical Huffman compression over simulated unreliable networks.**
 
 This is a system demonstrating:
 - **Compression**: Canonical Huffman coding with deterministic code assignment
@@ -275,29 +275,6 @@ encoder-sim/
 └── README.md
 ```
 
-## Learning Goals
-
-This project teaches:
-
-1. **Data encoding**: Variable-length codes, canonical forms, metadata serialization
-2. **Framing**: How to package data for transmission with integrity checks
-3. **Packetization**: MTU constraints, fragmentation, reassembly
-4. **Network simulation**: Latency models, packet loss, reordering
-5. **Flow control**: Bounded channels, backpressure, windowing
-6. **Concurrency**: Thread-based pipeline with message passing
-7. **Error handling**: Structured errors, graceful shutdown, no panics
-8. **Testing**: Unit tests, integration tests, deterministic reproduction
-9. **Systems thinking**: Memory bounds, observable behavior, failure modes
-
-## Non-Goals
-
-This is **not**:
-- A production compressor (use zstd, lz4, etc.)
-- A production network protocol (use TCP, QUIC, etc.)
-- Optimized for speed (use async, zero-copy, SIMD, etc.)
-
-The focus is **correctness, clarity, and learning**.
-
 ## Dependencies
 
 Minimal, justified dependencies:
@@ -349,15 +326,6 @@ cargo run --release -- --in large.bin --out received.bin --no-loss
 # Verify
 diff large.bin received.bin
 ```
-
-## Contributing
-
-This is an educational project. If you find bugs or have suggestions for making it more instructive, please open an issue!
-
-## License
-
-MIT
-
 ---
 
 **Built with Rust for learning systems programming, compression, and network protocols.**
