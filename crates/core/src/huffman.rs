@@ -1,0 +1,532 @@
+//! Canonical Huffman codec for byte symbols.
+//!
+//! # What is Canonical Huffman?
+//!
+//! Standard Huffman coding assigns variable-length bit codes to symbols based
+//! on their frequency. More frequent symbols get shorter codes. Canonical
+//! Huffman uses a normalized form where:
+//! 1. Codes of the same length are assigned in ascending symbol order
+//! 2. Shorter codes are numerically smaller than longer codes
+//!
+//! This makes the codebook more compact to transmit: we only need to send
+//! the code *lengths* for each symbol, not the actual codes themselves.
+//!
+//! # Algorithm Overview
+//!
+//! **Encoding:**
+//! 1. Count symbol frequencies in the input
+//! 2. Build optimal code lengths using a priority queue (Huffman tree)
+//! 3. Canonicalize: assign actual bit patterns based on lengths
+//! 4. Encode input symbols using the codebook
+//!
+//! **Decoding:**
+//! 1. Reconstruct the canonical codebook from transmitted lengths
+//! 2. Decode bits using a lookup table or tree traversal
+//!
+//! # Determinism
+//!
+//! To ensure reproducibility:
+//! - Symbols with equal frequency are ordered by symbol value (smaller first)
+//! - Canonical code assignment is deterministic given code lengths
+
+use crate::bitio::{BitReader, BitWriter};
+use crate::error::{HuffmanError, Result};
+use std::collections::BinaryHeap;
+
+/// Maximum code length we support (to avoid pathological cases)
+const MAX_CODE_LENGTH: usize = 255;
+
+/// A canonical Huffman codebook for 256 byte symbols.
+///
+/// Stores both encoding (symbol -> code) and decoding (code -> symbol) structures.
+#[derive(Debug, Clone)]
+pub struct Codebook {
+    /// Code lengths for each symbol (0 = symbol not present)
+    lengths: [u8; 256],
+
+    /// Actual bit codes for each symbol (only valid if length > 0)
+    codes: [u32; 256],
+
+    /// Symbols sorted by (length, symbol) for canonical construction
+    /// Used for serialization
+    symbols_by_length: Vec<(u8, u8)>, // (code_length, symbol)
+}
+
+impl Codebook {
+    /// Build a canonical Huffman codebook from symbol frequencies.
+    ///
+    /// # Arguments
+    /// - `freqs`: frequency count for each of the 256 possible byte values
+    ///
+    /// # Algorithm
+    /// 1. Build a Huffman tree using a min-heap (priority queue)
+    /// 2. Extract code lengths from the tree
+    /// 3. Canonicalize the codes
+    ///
+    /// # Errors
+    /// - `HuffmanError::EmptyFrequencyTable` if all frequencies are zero
+    /// - `HuffmanError::CodeLengthTooLong` if any code exceeds MAX_CODE_LENGTH
+    pub fn from_frequencies(freqs: &[u64; 256]) -> Result<Self> {
+        // Count non-zero symbols
+        let active_symbols: Vec<_> = (0..256)
+            .filter(|&i| freqs[i] > 0)
+            .map(|i| i as u8)
+            .collect();
+
+        if active_symbols.is_empty() {
+            return Err(HuffmanError::EmptyFrequencyTable.into());
+        }
+
+        // Special case: single symbol (code length = 1)
+        if active_symbols.len() == 1 {
+            let mut lengths = [0u8; 256];
+            let mut codes = [0u32; 256];
+            let symbol = active_symbols[0];
+
+            lengths[symbol as usize] = 1;
+            codes[symbol as usize] = 0;
+
+            return Ok(Self {
+                lengths,
+                codes,
+                symbols_by_length: vec![(1, symbol)],
+            });
+        }
+
+        // Build Huffman tree using priority queue
+        let lengths = Self::build_code_lengths(&freqs, &active_symbols)?;
+
+        // Canonicalize codes
+        let (codes, symbols_by_length) = Self::canonicalize(&lengths);
+
+        Ok(Self {
+            lengths,
+            codes,
+            symbols_by_length,
+        })
+    }
+
+    /// Build optimal code lengths using Huffman's algorithm.
+    ///
+    /// Uses a min-heap to build the Huffman tree, then computes depths.
+    /// For determinism, when frequencies are equal, we order by symbol value.
+    fn build_code_lengths(freqs: &[u64; 256], active: &[u8]) -> Result<[u8; 256]> {
+        // Node in the Huffman tree
+        #[derive(Debug, Clone, Eq, PartialEq)]
+        struct Node {
+            freq: u64,
+            // For tie-breaking: minimum symbol in this subtree
+            min_symbol: u8,
+            // Tree structure: None for leaves, Some(Box) for internal nodes
+            left: Option<Box<Node>>,
+            right: Option<Box<Node>>,
+            // For leaves: Some(symbol), for internal nodes: None
+            symbol: Option<u8>,
+        }
+
+        impl Ord for Node {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                // Primary: compare frequency (min-heap: lower freq = higher priority)
+                // Secondary: compare min_symbol (deterministic tie-breaking)
+                (other.freq, other.min_symbol).cmp(&(self.freq, self.min_symbol))
+            }
+        }
+
+        impl PartialOrd for Node {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        // Initialize heap with leaf nodes
+        let mut heap = BinaryHeap::new();
+        for &sym in active {
+            heap.push(Node {
+                freq: freqs[sym as usize],
+                min_symbol: sym,
+                left: None,
+                right: None,
+                symbol: Some(sym),
+            });
+        }
+
+        // Build tree by merging nodes
+        while heap.len() > 1 {
+            let left = heap.pop().unwrap();
+            let right = heap.pop().unwrap();
+
+            heap.push(Node {
+                freq: left.freq + right.freq,
+                min_symbol: left.min_symbol.min(right.min_symbol),
+                left: Some(Box::new(left)),
+                right: Some(Box::new(right)),
+                symbol: None,
+            });
+        }
+
+        // Compute depths by traversing the tree
+        let mut lengths = [0u8; 256];
+
+        if let Some(root) = heap.pop() {
+            // Recursive function to compute depths
+            fn compute_depths(node: &Node, depth: usize, lengths: &mut [u8; 256]) {
+                if let Some(sym) = node.symbol {
+                    // Leaf node: record depth for this symbol
+                    lengths[sym as usize] = depth as u8;
+                } else {
+                    // Internal node: recurse on children
+                    if let Some(ref left) = node.left {
+                        compute_depths(left, depth + 1, lengths);
+                    }
+                    if let Some(ref right) = node.right {
+                        compute_depths(right, depth + 1, lengths);
+                    }
+                }
+            }
+
+            // Start traversal from root
+            // Special case: if root is a leaf (single symbol), depth is 1
+            if root.symbol.is_some() {
+                lengths[root.symbol.unwrap() as usize] = 1;
+            } else {
+                compute_depths(&root, 0, &mut lengths);
+            }
+        }
+
+        // Validate code lengths
+        for &len in lengths.iter() {
+            if len as usize > MAX_CODE_LENGTH {
+                return Err(HuffmanError::CodeLengthTooLong {
+                    length: len as usize,
+                }
+                .into());
+            }
+        }
+
+        Ok(lengths)
+    }
+
+    /// Assign canonical codes given code lengths.
+    ///
+    /// Canonical property: codes of same length are assigned in ascending
+    /// symbol order, and are numerically sequential.
+    ///
+    /// Returns (codes array, sorted symbols for serialization).
+    fn canonicalize(lengths: &[u8; 256]) -> ([u32; 256], Vec<(u8, u8)>) {
+        let mut codes = [0u32; 256];
+
+        // Collect symbols with non-zero length, sorted by (length, symbol)
+        let mut symbols_by_length: Vec<_> = (0..256)
+            .filter(|&i| lengths[i] > 0)
+            .map(|i| (lengths[i], i as u8))
+            .collect();
+
+        symbols_by_length.sort_unstable();
+
+        // Assign codes canonically
+        let mut code = 0u32;
+        let mut prev_length = 0u8;
+
+        for &(length, symbol) in &symbols_by_length {
+            // When moving to a longer code length, shift left
+            if length > prev_length {
+                code <<= length - prev_length;
+                prev_length = length;
+            }
+
+            codes[symbol as usize] = code;
+            code += 1;
+        }
+
+        (codes, symbols_by_length)
+    }
+
+    /// Encode data using this codebook.
+    ///
+    /// Returns the encoded bits as a byte vector (padded to byte boundary).
+    pub fn encode(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let mut writer = BitWriter::new();
+
+        for &symbol in data {
+            let length = self.lengths[symbol as usize];
+            if length == 0 {
+                // Symbol not in codebook - this should not happen if codebook
+                // was built from the same data, but handle gracefully
+                return Err(HuffmanError::InvalidCode { position: 0 }.into());
+            }
+
+            let code = self.codes[symbol as usize];
+            writer.write_bits(code as u64, length as usize)?;
+        }
+
+        Ok(writer.finish())
+    }
+
+    /// Decode bits using this codebook.
+    ///
+    /// # Arguments
+    /// - `bits`: encoded bit stream
+    /// - `expected_len`: number of symbols to decode (for validation)
+    ///
+    /// # Errors
+    /// - `HuffmanError::InvalidCode` if an invalid bit sequence is encountered
+    /// - `HuffmanError::LengthMismatch` if decoded length doesn't match expected
+    pub fn decode(&self, bits: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+        let mut reader = BitReader::new(bits);
+        let mut result = Vec::with_capacity(expected_len);
+
+        // Decode by tree traversal
+        // We reconstruct the tree structure implicitly by reading bits
+        while result.len() < expected_len {
+            let mut code = 0u32;
+            let mut length = 0usize;
+
+            // Read bits one at a time until we find a matching code
+            loop {
+                if reader.is_empty() {
+                    // Ran out of bits before decoding expected symbols
+                    return Err(HuffmanError::LengthMismatch {
+                        expected: expected_len,
+                        actual: result.len(),
+                    }
+                    .into());
+                }
+
+                let bit = reader.read_bit()?;
+                code = (code << 1) | (bit as u32);
+                length += 1;
+
+                if length > MAX_CODE_LENGTH {
+                    return Err(HuffmanError::InvalidCode {
+                        position: reader.position(),
+                    }
+                    .into());
+                }
+
+                // Check if this code matches any symbol
+                if let Some(symbol) = self.find_symbol(code, length as u8) {
+                    result.push(symbol);
+                    break;
+                }
+            }
+        }
+
+        // Validate we decoded exactly the expected number of symbols
+        if result.len() != expected_len {
+            return Err(HuffmanError::LengthMismatch {
+                expected: expected_len,
+                actual: result.len(),
+            }
+            .into());
+        }
+
+        Ok(result)
+    }
+
+    /// Find the symbol corresponding to a code of given length.
+    ///
+    /// Returns None if no symbol matches.
+    fn find_symbol(&self, code: u32, length: u8) -> Option<u8> {
+        // Linear search through symbols of matching length
+        // For better performance, could build a lookup table, but keeping simple
+        for i in 0..256 {
+            if self.lengths[i] == length && self.codes[i] == code {
+                return Some(i as u8);
+            }
+        }
+        None
+    }
+
+    /// Serialize codebook metadata for transmission.
+    ///
+    /// Format:
+    /// - num_symbols (u16, little-endian): count of symbols with non-zero code length
+    /// - For each symbol: (symbol: u8, code_length: u8)
+    ///
+    /// The receiver can reconstruct the canonical codes from just the lengths.
+    pub fn serialize_metadata(&self) -> Vec<u8> {
+        let mut metadata = Vec::new();
+
+        // Write number of active symbols (u16 to support up to 256 symbols)
+        let num_symbols = self.symbols_by_length.len() as u16;
+        metadata.extend_from_slice(&num_symbols.to_le_bytes());
+
+        // Write (symbol, length) pairs
+        for &(length, symbol) in &self.symbols_by_length {
+            metadata.push(symbol);
+            metadata.push(length);
+        }
+
+        metadata
+    }
+
+    /// Deserialize codebook metadata and reconstruct the canonical codebook.
+    ///
+    /// # Errors
+    /// Returns error if metadata is malformed or lengths are invalid.
+    pub fn deserialize_metadata(metadata: &[u8]) -> Result<Self> {
+        if metadata.len() < 2 {
+            return Err(HuffmanError::EmptyFrequencyTable.into());
+        }
+
+        // Read num_symbols as u16 (little-endian)
+        let num_symbols = u16::from_le_bytes([metadata[0], metadata[1]]) as usize;
+        let expected_len = 2 + num_symbols * 2;
+
+        if metadata.len() != expected_len {
+            return Err(HuffmanError::InvalidCode { position: 0 }.into());
+        }
+
+        let mut lengths = [0u8; 256];
+        let mut symbols_by_length = Vec::with_capacity(num_symbols);
+
+        for i in 0..num_symbols {
+            let symbol = metadata[2 + i * 2];
+            let length = metadata[2 + i * 2 + 1];
+
+            if length as usize > MAX_CODE_LENGTH {
+                return Err(HuffmanError::CodeLengthTooLong {
+                    length: length as usize,
+                }
+                .into());
+            }
+
+            lengths[symbol as usize] = length;
+            symbols_by_length.push((length, symbol));
+        }
+
+        // Sort and canonicalize
+        symbols_by_length.sort_unstable();
+        let (codes, _) = Self::canonicalize(&lengths);
+
+        Ok(Self {
+            lengths,
+            codes,
+            symbols_by_length,
+        })
+    }
+
+    /// Get the code lengths array (for testing/debugging).
+    pub fn lengths(&self) -> &[u8; 256] {
+        &self.lengths
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_single_symbol() {
+        let mut freqs = [0u64; 256];
+        freqs[b'A' as usize] = 100;
+
+        let codebook = Codebook::from_frequencies(&freqs).unwrap();
+        assert_eq!(codebook.lengths[b'A' as usize], 1);
+
+        let encoded = codebook.encode(b"AAAA").unwrap();
+        let decoded = codebook.decode(&encoded, 4).unwrap();
+        assert_eq!(decoded, b"AAAA");
+    }
+
+    #[test]
+    fn test_two_symbols() {
+        let mut freqs = [0u64; 256];
+        freqs[b'A' as usize] = 3;
+        freqs[b'B' as usize] = 1;
+
+        let codebook = Codebook::from_frequencies(&freqs).unwrap();
+
+        // 'A' should have length 1, 'B' should have length 1
+        assert_eq!(codebook.lengths[b'A' as usize], 1);
+        assert_eq!(codebook.lengths[b'B' as usize], 1);
+
+        let data = b"AAAB";
+        let encoded = codebook.encode(data).unwrap();
+        let decoded = codebook.decode(&encoded, data.len()).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_canonical_property() {
+        let mut freqs = [0u64; 256];
+        freqs[b'A' as usize] = 10;
+        freqs[b'B' as usize] = 5;
+        freqs[b'C' as usize] = 2;
+        freqs[b'D' as usize] = 1;
+
+        let codebook = Codebook::from_frequencies(&freqs).unwrap();
+
+        // Check that codes of same length are in ascending order
+        let len_a = codebook.lengths[b'A' as usize];
+        let len_b = codebook.lengths[b'B' as usize];
+        let code_a = codebook.codes[b'A' as usize];
+        let code_b = codebook.codes[b'B' as usize];
+
+        if len_a == len_b && b'A' < b'B' {
+            assert!(code_a < code_b, "Canonical property violated");
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_round_trip() {
+        let data = b"hello world! this is a test of huffman coding.";
+
+        // Build frequency table
+        let mut freqs = [0u64; 256];
+        for &byte in data.iter() {
+            freqs[byte as usize] += 1;
+        }
+
+        let codebook = Codebook::from_frequencies(&freqs).unwrap();
+        let encoded = codebook.encode(data).unwrap();
+        let decoded = codebook.decode(&encoded, data.len()).unwrap();
+
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_metadata() {
+        let mut freqs = [0u64; 256];
+        freqs[b'A' as usize] = 10;
+        freqs[b'B' as usize] = 5;
+        freqs[b'C' as usize] = 2;
+
+        let codebook = Codebook::from_frequencies(&freqs).unwrap();
+        let metadata = codebook.serialize_metadata();
+
+        let reconstructed = Codebook::deserialize_metadata(&metadata).unwrap();
+
+        // Check that lengths match
+        assert_eq!(reconstructed.lengths, codebook.lengths);
+
+        // Test encode/decode with reconstructed codebook
+        let data = b"AAABBC";
+        let encoded = codebook.encode(data).unwrap();
+        let decoded = reconstructed.decode(&encoded, data.len()).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_empty_frequencies() {
+        let freqs = [0u64; 256];
+        let result = Codebook::from_frequencies(&freqs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_determinism() {
+        // Build codebook twice with same frequencies
+        let mut freqs = [0u64; 256];
+        freqs[b'A' as usize] = 5;
+        freqs[b'B' as usize] = 5; // Equal frequency
+        freqs[b'C' as usize] = 3;
+
+        let codebook1 = Codebook::from_frequencies(&freqs).unwrap();
+        let codebook2 = Codebook::from_frequencies(&freqs).unwrap();
+
+        // Should produce identical codebooks
+        assert_eq!(codebook1.lengths, codebook2.lengths);
+        assert_eq!(codebook1.codes, codebook2.codes);
+    }
+}

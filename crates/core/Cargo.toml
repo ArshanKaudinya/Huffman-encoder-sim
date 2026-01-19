@@ -1,0 +1,15 @@
+[package]
+name = "encoder-sim-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+crossbeam-channel = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+
+[dev-dependencies]
+# For testing
+rand = { workspace = true }

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(/Users/arshankaudinya/.cargo/bin/cargo test:*)",
+      "Bash(/Users/arshankaudinya/.cargo/bin/cargo run --release)",
+      "Bash(/Users/arshankaudinya/.cargo/bin/cargo run:*)"
+    ]
+  }
+}

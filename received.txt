@@ -1,0 +1,10 @@
+hi, this is a text file created by Arshan to test the encoder.
+
+
+
+
+
+
+
+
+to help make sure it works

@@ -1,0 +1,15 @@
+[package]
+name = "encoder-sim"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "encoder-sim"
+path = "src/main.rs"
+
+[dependencies]
+encoder-sim-core = { path = "../core" }
+crossbeam-channel = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+thiserror = { workspace = true }

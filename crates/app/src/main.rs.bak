@@ -1,0 +1,375 @@
+//! Main binary for encoder-sim: educational file transfer with compression.
+//!
+//! This orchestrates the full pipeline:
+//! 1. Read input (file or generated)
+//! 2. Chunk and compress
+//! 3. Packetize
+//! 4. Simulate network
+//! 5. Reassemble
+//! 6. Decompress and write output
+//!
+//! # Architecture
+//!
+//! Uses threads + bounded channels for each pipeline stage:
+//! - Thread 1: Chunker/Compressor
+//! - Thread 2: Packetizer
+//! - Thread 3: Network simulator
+//! - Thread 4: Receiver/Reassembler
+//! - Main thread: Decoder/Writer + coordination
+
+mod config;
+mod input_gen;
+
+use config::Config;
+use crossbeam_channel::{bounded, Receiver, Sender};
+use encoder_sim_core::{
+    error::Result,
+    framing::{compress_and_frame, decompress_frame, parse_chunk_frame},
+    metrics::{Metrics, ReorderTracker},
+    network::NetworkSimulator,
+    packet::{packetize, Packet},
+    reassembly::Reassembler,
+};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+
+fn main() {
+    // Parse args
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let config = match Config::from_args(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if config.print_config {
+        config.print();
+    }
+
+    // Run transfer
+    match run_transfer(&config) {
+        Ok(metrics) => {
+            if config.print_metrics {
+                metrics.print_summary();
+            } else {
+                metrics.print_result();
+            }
+        }
+        Err(e) => {
+            eprintln!("\n✗ Transfer failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run the full transfer pipeline.
+fn run_transfer(config: &Config) -> Result<Metrics> {
+    // Initialize metrics
+    let metrics = Arc::new(Mutex::new(Metrics::new()));
+
+    // Read or generate input
+    let input_data = load_input(config, &metrics)?;
+
+    println!("Starting transfer of {} bytes...", input_data.len());
+
+    // Create channels (all bounded)
+    let (chunk_tx, chunk_rx) = bounded(config.channel_capacity);
+    let (packet_tx, packet_rx) = bounded(config.channel_capacity);
+    let (network_tx, network_rx) = bounded(config.channel_capacity);
+    let (reassembled_tx, reassembled_rx) = bounded(config.channel_capacity);
+
+    // Spawn threads for each pipeline stage
+    let chunk_bytes = config.chunk_bytes;
+    let metrics_clone = Arc::clone(&metrics);
+    let chunker_thread = std::thread::spawn(move || {
+        chunker_thread(input_data, chunk_bytes, chunk_tx, metrics_clone)
+    });
+
+    let mtu = config.mtu_bytes;
+    let metrics_clone = Arc::clone(&metrics);
+    let packetizer_thread = std::thread::spawn(move || {
+        packetizer_thread(chunk_rx, mtu, packet_tx, metrics_clone)
+    });
+
+    let network_config = config.network;
+    let metrics_clone = Arc::clone(&metrics);
+    let network_thread = std::thread::spawn(move || {
+        network_thread(packet_rx, network_tx, network_config, metrics_clone)
+    });
+
+    let max_inflight = config.max_inflight_chunks;
+    let timeout_ms = config.reassembly_timeout_ms;
+    let metrics_clone = Arc::clone(&metrics);
+    let receiver_thread = std::thread::spawn(move || {
+        receiver_thread(network_rx, reassembled_tx, max_inflight, timeout_ms, metrics_clone)
+    });
+
+    // Main thread: decode and write output
+    let output_path = config.output_file.clone();
+    let metrics_clone = Arc::clone(&metrics);
+    let decoder_result = decoder_thread(reassembled_rx, &output_path, metrics_clone);
+
+    // Wait for all threads
+    chunker_thread.join().expect("chunker thread panicked")?;
+    packetizer_thread.join().expect("packetizer thread panicked")?;
+    network_thread.join().expect("network thread panicked")?;
+    receiver_thread.join().expect("receiver thread panicked")?;
+    decoder_result?;
+
+    // Finalize metrics
+    let mut metrics = metrics.lock().unwrap();
+    metrics.complete();
+
+    Ok(metrics.clone())
+}
+
+/// Load input data from file or generate it.
+fn load_input(config: &Config, metrics: &Arc<Mutex<Metrics>>) -> Result<Vec<u8>> {
+    let data = if let Some(input_path) = &config.input_file {
+        // Read from file
+        let mut file = File::open(input_path)?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        println!("Read {} bytes from {:?}", data.len(), input_path);
+        data
+    } else {
+        // Generate sample data
+        let size = 256 * 1024; // 256 KiB default
+        println!("Generating {} bytes of sample data (seed: {})...", size, config.network.seed);
+        input_gen::generate_sample_data(config.network.seed, size)
+    };
+
+    // Record input size
+    metrics.lock().unwrap().input_bytes = data.len() as u64;
+
+    Ok(data)
+}
+
+/// Thread: chunk input and compress.
+fn chunker_thread(
+    input: Vec<u8>,
+    chunk_bytes: usize,
+    tx: Sender<Vec<u8>>,
+    metrics: Arc<Mutex<Metrics>>,
+) -> Result<()> {
+    let mut chunk_id = 0u64;
+
+    for chunk in input.chunks(chunk_bytes) {
+        // Compress and frame
+        let frame = compress_and_frame(chunk_id, chunk)?;
+
+        // Update metrics
+        {
+            let mut m = metrics.lock().unwrap();
+            m.chunks_created += 1;
+            m.raw_chunk_bytes += chunk.len() as u64;
+            m.compressed_chunk_bytes += frame.len() as u64;
+        }
+
+        // Send to next stage
+        tx.send(frame).map_err(|_| "channel closed")?;
+
+        chunk_id += 1;
+    }
+
+    // Close channel to signal completion
+    drop(tx);
+
+    Ok(())
+}
+
+/// Thread: packetize chunk frames.
+fn packetizer_thread(
+    rx: Receiver<Vec<u8>>,
+    mtu: usize,
+    tx: Sender<Packet>,
+    metrics: Arc<Mutex<Metrics>>,
+) -> Result<()> {
+    let mut chunk_id = 0u64;
+
+    while let Ok(chunk_frame) = rx.recv() {
+        // Packetize
+        let packets = packetize(chunk_id, &chunk_frame, mtu)?;
+
+        // Update metrics
+        metrics.lock().unwrap().packets_generated += packets.len() as u64;
+
+        // Send packets
+        for packet in packets {
+            tx.send(packet).map_err(|_| "channel closed")?;
+        }
+
+        chunk_id += 1;
+    }
+
+    drop(tx);
+    Ok(())
+}
+
+/// Thread: simulate network.
+fn network_thread(
+    rx: Receiver<Packet>,
+    tx: Sender<Packet>,
+    config: encoder_sim_core::network::NetworkConfig,
+    metrics: Arc<Mutex<Metrics>>,
+) -> Result<()> {
+    let mut sim = NetworkSimulator::new(config);
+
+    // Spawn a receiver loop in parallel
+    let tx_clone = tx.clone();
+    let metrics_clone = Arc::clone(&metrics);
+    let receiver_handle = std::thread::spawn(move || {
+        loop {
+            // Try to receive packets
+            if let Some(packet) = sim.recv() {
+                if tx_clone.send(packet).is_err() {
+                    break; // Channel closed
+                }
+            } else if !sim.has_pending() {
+                // No packets in flight and none coming
+                break;
+            } else {
+                // Wait a bit for packets to be ready
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        }
+
+        // Update final network stats
+        let stats = sim.stats();
+        let mut m = metrics_clone.lock().unwrap();
+        m.packets_dropped = stats.packets_dropped;
+    });
+
+    // Main loop: feed packets into simulator
+    while let Ok(packet) = rx.recv() {
+        metrics.lock().unwrap().packets_sent += 1;
+        sim.send(packet);
+    }
+
+    // Wait for all packets to be delivered
+    receiver_handle.join().expect("network receiver panicked");
+
+    drop(tx);
+    Ok(())
+}
+
+/// Thread: reassemble packets into chunk frames.
+fn receiver_thread(
+    rx: Receiver<Packet>,
+    tx: Sender<(u64, Vec<u8>)>,
+    max_inflight: usize,
+    timeout_ms: u64,
+    metrics: Arc<Mutex<Metrics>>,
+) -> Result<()> {
+    let mut reassembler = Reassembler::new(max_inflight, timeout_ms);
+    let mut reorder_tracker = ReorderTracker::new();
+    let mut last_packet_time = std::time::Instant::now();
+
+    loop {
+        // Try to receive packet with timeout
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(packet) => {
+                last_packet_time = std::time::Instant::now();
+
+                // Track reordering
+                let is_reordered = reorder_tracker.track(packet.chunk_id, packet.packet_id);
+                if is_reordered {
+                    metrics.lock().unwrap().packets_reordered += 1;
+                }
+
+                metrics.lock().unwrap().packets_received += 1;
+
+                // Insert into reassembler
+                match reassembler.insert_packet(packet) {
+                    Ok(Some((chunk_id, frame_bytes))) => {
+                        // Chunk complete, send downstream
+                        metrics.lock().unwrap().chunks_reassembled += 1;
+                        reorder_tracker.clear_chunk(chunk_id);
+
+                        tx.send((chunk_id, frame_bytes)).map_err(|_| "channel closed")?;
+
+                        // Try to drain more completed chunks
+                        for (chunk_id, frame_bytes) in reassembler.drain_completed() {
+                            metrics.lock().unwrap().chunks_reassembled += 1;
+                            reorder_tracker.clear_chunk(chunk_id);
+                            tx.send((chunk_id, frame_bytes)).map_err(|_| "channel closed")?;
+                        }
+                    }
+                    Ok(None) => {
+                        // Packet buffered, not yet complete
+                    }
+                    Err(e) => {
+                        // Handle errors (duplicate, etc.)
+                        eprintln!("Reassembly error: {}", e);
+                        metrics.lock().unwrap().packets_invalid += 1;
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // Check for timeouts
+                let errors = reassembler.check_timeouts();
+                if !errors.is_empty() {
+                    for err in errors {
+                        eprintln!("Timeout: {}", err);
+                        metrics.lock().unwrap().chunks_timed_out += 1;
+                    }
+                    drop(tx);
+                    return Err("chunks timed out".into());
+                }
+
+                // Check if we've been idle too long
+                if last_packet_time.elapsed() > Duration::from_millis(timeout_ms * 2) && reassembler.is_idle() {
+                    // No packets for a while and nothing in flight
+                    break;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                // Channel closed, finish up
+                break;
+            }
+        }
+    }
+
+    drop(tx);
+    Ok(())
+}
+
+/// Thread: decode chunk frames and write to output file.
+fn decoder_thread(
+    rx: Receiver<(u64, Vec<u8>)>,
+    output_path: &Path,
+    metrics: Arc<Mutex<Metrics>>,
+) -> Result<()> {
+    let mut output_file = File::create(output_path)?;
+    let mut total_written = 0u64;
+
+    while let Ok((_chunk_id, frame_bytes)) = rx.recv() {
+        // Parse frame
+        let frame = parse_chunk_frame(&frame_bytes)?;
+
+        // Decode
+        let decoded = decompress_frame(&frame)?;
+
+        // Write to file
+        output_file.write_all(&decoded)?;
+        total_written += decoded.len() as u64;
+
+        // Update metrics
+        {
+            let mut m = metrics.lock().unwrap();
+            m.chunks_decoded += 1;
+            m.output_bytes = total_written;
+        }
+    }
+
+    println!("Wrote {} bytes to {:?}", total_written, output_path);
+
+    Ok(())
+}
